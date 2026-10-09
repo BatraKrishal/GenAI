@@ -16,7 +16,7 @@ Your task is to provide accurate, context-aware, and helpful answers strictly gr
 
 CRITICAL RULES:
 1. STRICT DATASET GROUNDING: Answer ONLY using the facts present in the provided snippets. Do NOT assume, extrapolate, or use external knowledge.
-2. CITATIONS: Every factual statement or policy detail must include a source citation formatted as: [Doc: Page {page_number}, Section: {section}].
+2. CITATIONS: Every factual statement or policy detail must include a source citation formatted as: [Doc: Page {{page_number}}, Section: {{section}}].
 3. ZERO HALLUCINATIONS: If the provided snippets do not contain sufficient information to answer the question, or if the question is unanswerable from the context, state EXACTLY:
 "{fallback_response}"
 Never make up dates, fees, rules, faculty names, or email addresses.
@@ -112,41 +112,105 @@ class CampusGroundingEngine:
                 "excerpt": chunk.get("text", "")[:180] + "..."
             })
 
-        if self.client:
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt
-                )
-                answer_text = response.text.strip()
-                
-                # Check if model invoked fallback
-                is_grounded = FALLBACK_RESPONSE not in answer_text
+    def _call_gemini_api(self, prompt: str) -> Optional[str]:
+        """Calls Gemini API directly over IPv4 REST with timeout to prevent hangs."""
+        if not self.api_key:
+            return None
+        import requests
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 600}
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=7)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates and "content" in candidates[0]:
+                    parts = candidates[0]["content"].get("parts", [])
+                    if parts and "text" in parts[0]:
+                        return parts[0]["text"].strip()
+            else:
+                logger.warning(f"Gemini API returned status {resp.status_code}: {resp.text[:120]}")
+        except Exception as e:
+            logger.warning(f"Gemini API call timed out or failed: {e}")
+        return None
 
-                return {
-                    "answer": answer_text,
-                    "is_grounded": is_grounded,
-                    "citations": citations if is_grounded else [],
-                    "confidence": retrieved_chunks[0].get("dense_score", 0.8)
-                }
-            except Exception as e:
-                logger.error(f"Error calling LLM API: {e}")
-                return {
-                    "answer": f"Error generating grounded response: {str(e)}",
-                    "is_grounded": False,
-                    "citations": citations,
-                    "confidence": 0.0
-                }
+    def generate_grounded_answer(
+        self,
+        query: str,
+        retrieved_chunks: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        persona: str = "Student",
+        language: str = "en"
+    ) -> Dict[str, Any]:
+        """
+        Generates a grounded answer. If context is empty or unconfident, returns safe fallback.
+        """
+        # If no chunks were retrieved with sufficient confidence
+        if not retrieved_chunks:
+            return {
+                "answer": FALLBACK_RESPONSE,
+                "is_grounded": False,
+                "citations": [],
+                "confidence": 0.0
+            }
 
-        # Offline / Mock Fallback if API key not set yet
-        mock_answer = (
-            f"Based on the official campus document (Page {citations[0]['page']}), "
-            f"here is the verified information regarding '{query}':\n\n"
-            f"> \"{retrieved_chunks[0]['text'][:300]}...\"\n\n"
-            f"[Doc: Page {citations[0]['page']}, Section: {citations[0]['section']}]"
+        citations = []
+        for chunk in retrieved_chunks:
+            meta = chunk.get("metadata", {})
+            citations.append({
+                "page": meta.get("page_number", 1),
+                "section": meta.get("section", "General"),
+                "source": meta.get("source", "Campus Document"),
+                "excerpt": chunk.get("text", "")[:200] + "..."
+            })
+
+        context_blocks = self.format_context(retrieved_chunks)
+        system_instruction = SYSTEM_PROMPT_TEMPLATE.format(
+            fallback_response=FALLBACK_RESPONSE,
+            persona=persona,
+            context_blocks=context_blocks
         )
+
+        # Build prompt with history
+        history_text = ""
+        if conversation_history:
+            for msg in conversation_history[-4:]:
+                role = "User" if msg.get("role") == "user" else "Assistant"
+                history_text += f"{role}: {msg.get('content', '')}\n"
+
+        prompt = f"{system_instruction}\n\nCONVERSATION HISTORY:\n{history_text}\nUSER QUERY: {query}\n\nASSISTANT ANSWER:"
+
+        # Call Gemini with fast timeout
+        answer_text = self._call_gemini_api(prompt)
+
+        if answer_text:
+            is_grounded = FALLBACK_RESPONSE not in answer_text
+            return {
+                "answer": answer_text,
+                "is_grounded": is_grounded,
+                "citations": citations if is_grounded else [],
+                "confidence": retrieved_chunks[0].get("dense_score", 0.85)
+            }
+
+        # Fail-safe Offline Grounded Extractive Mode
+        logger.info("Using high-precision extractive grounding synthesizer.")
+        top_chunk = retrieved_chunks[0]
+        meta = top_chunk.get("metadata", {})
+        page = meta.get("page_number", 1)
+        section = meta.get("section", "General Information")
+        clean_text = top_chunk.get("text", "").strip()
+
+        extractive_answer = (
+            f"Based on the official campus document (**Page {page}**, {section}):\n\n"
+            f"{clean_text}\n\n"
+            f"[Doc: Page {page}, Section: {section}]"
+        )
+
         return {
-            "answer": mock_answer,
+            "answer": extractive_answer,
             "is_grounded": True,
             "citations": citations,
             "confidence": 0.85

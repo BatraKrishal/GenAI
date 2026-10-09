@@ -58,17 +58,20 @@ class CampusHybridRetriever:
         """
         Indexes chunks into both ChromaDB and the BM25 index.
         """
+        self.collection = self.chroma_client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+
         if clear_existing:
             try:
-                self.chroma_client.delete_collection(self.collection_name)
-                self.collection = self.chroma_client.create_collection(
-                    name=self.collection_name,
-                    metadata={"hnsw:space": "cosine"}
-                )
+                existing = self.collection.get()
+                if existing and existing.get("ids"):
+                    self.collection.delete(ids=existing["ids"])
                 self.bm25_corpus = []
                 self.bm25 = None
             except Exception as e:
-                logger.warning(f"Error resetting collection: {e}")
+                logger.warning(f"Error resetting existing items: {e}")
 
         ids = [c["chunk_id"] for c in chunks]
         documents = [c["text"] for c in chunks]
@@ -100,6 +103,14 @@ class CampusHybridRetriever:
         Returns:
             (top_chunks, is_confident, max_confidence_score)
         """
+        self.collection = self.chroma_client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+
+        if not self.bm25_corpus:
+            self._init_bm25_from_chroma()
+
         if not self.bm25_corpus:
             return [], False, 0.0
 

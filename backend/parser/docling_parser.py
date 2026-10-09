@@ -19,12 +19,27 @@ class CampusDocParser:
     def _init_converter(self):
         if self._converter is None:
             try:
-                from docling.document_converter import DocumentConverter
-                self._converter = DocumentConverter()
-                logger.info("Docling DocumentConverter initialized successfully.")
+                from docling.document_converter import DocumentConverter, PdfFormatOption
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+
+                pipeline_options = PdfPipelineOptions()
+                pipeline_options.do_ocr = self.use_ocr  # False by default for instant speed
+                pipeline_options.do_table_structure = True
+
+                self._converter = DocumentConverter(
+                    format_options={
+                        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                    }
+                )
+                logger.info("Docling DocumentConverter initialized with fast non-OCR pipeline.")
             except Exception as e:
-                logger.warning(f"Failed to initialize Docling: {e}. Fallback parser will be used.")
-                self._converter = None
+                logger.warning(f"Failed to initialize optimized Docling: {e}. Falling back to default.")
+                try:
+                    from docling.document_converter import DocumentConverter
+                    self._converter = DocumentConverter()
+                except Exception:
+                    self._converter = None
 
     def parse_document(self, file_path: str | Path) -> Dict[str, Any]:
         """

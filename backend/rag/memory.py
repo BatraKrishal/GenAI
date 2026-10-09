@@ -52,9 +52,11 @@ class ConversationMemoryManager:
         if not has_ambiguity and not is_short_followup:
             return current_query
 
-        # If LLM client is available, use fast query reformulation
-        if client:
+        # If API key is available, use fast REST query reformulation
+        from backend.config import GEMINI_API_KEY, DEFAULT_LLM_MODEL
+        if GEMINI_API_KEY:
             try:
+                import requests
                 recent_context = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in history[-3:]])
                 prompt = (
                     "Given the recent conversation history, rewrite the user's latest follow-up question "
@@ -64,16 +66,23 @@ class ConversationMemoryManager:
                     f"FOLLOW-UP: {current_query}\n\n"
                     "STANDALONE QUERY:"
                 )
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=prompt
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{DEFAULT_LLM_MODEL}:generateContent?key={GEMINI_API_KEY}"
+                resp = requests.post(
+                    url,
+                    json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 60}},
+                    timeout=3
                 )
-                rewritten = response.text.strip().replace('"', '')
-                if rewritten:
-                    logger.info(f"Recontextualized Query: '{current_query}' -> '{rewritten}'")
-                    return rewritten
+                if resp.status_code == 200:
+                    cand = resp.json().get("candidates", [])
+                    if cand and "content" in cand[0]:
+                        parts = cand[0]["content"].get("parts", [])
+                        if parts and "text" in parts[0]:
+                            rewritten = parts[0]["text"].strip().replace('"', '')
+                            if rewritten:
+                                logger.info(f"Recontextualized Query: '{current_query}' -> '{rewritten}'")
+                                return rewritten
             except Exception as e:
-                logger.warning(f"LLM query rewriting failed: {e}")
+                logger.warning(f"Fast query rewriting failed or timed out: {e}")
 
         # Rule-based fallback coreference resolution
         last_turn = history[-1]["content"] if history else ""
